@@ -1,133 +1,151 @@
-"""请求/响应模型与输入校验。"""
+"""请求/响应模型（Pydantic v2）。"""
 
 from __future__ import annotations
 
-from typing import List, Optional, Union
+import math
+import re
+from datetime import datetime
+from typing import Annotated, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-MAX_ROWS = 50
+DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# 值：数字或字符串（拒绝布尔、null、非有限浮点）。
+Value = Union[int, float, str]
 
 
-class PlanRow(BaseModel):
-    """进样计划中的一行。"""
+def _validate_date(value: str) -> str:
+    if not DATE_PATTERN.match(value):
+        raise ValueError("日期必须为 YYYY-MM-DD 格式")
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"不存在的日期: {value}")
+    return value
 
-    row_id: str = Field(..., min_length=1, description="计划行唯一行号")
-    sample_no: Optional[str] = Field(
-        None, description="样品号；旧记录可能缺失，缺失为 null 或空串"
-    )
-    well_position: str = Field(..., min_length=1, description="孔位，如 A01")
-    analyte: str = Field(..., min_length=1, description="检测项目，如 铅Pb")
-    planned_at: StrictInt = Field(..., description="计划时间，整数 UTC 秒")
 
-    @field_validator("sample_no")
+def _validate_value(value: object) -> Value:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("值必须为数字或字符串")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("值必须为有限数字")
+    return value  # type: ignore[return-value]
+
+
+class PutOp(BaseModel):
+    """写入一条完整结果；同 ID 已存在时替换。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["put"] = "put"
+    id: str = Field(min_length=1, max_length=128, description="结果唯一 ID")
+    sample_code: str = Field(min_length=1, max_length=128, description="样品码")
+    project: str = Field(min_length=1, max_length=128, description="检测项目")
+    test_date: str = Field(description="检测日期 YYYY-MM-DD")
+    value: Value = Field(description="检测值：数字或字符串")
+
+    @field_validator("test_date")
     @classmethod
-    def _normalize_sample_no(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        value = value.strip()
-        return value or None
+    def _check_date(cls, v: str) -> str:
+        return _validate_date(v)
 
-    @field_validator("well_position", "analyte", "row_id")
+    @field_validator("value", mode="before")
     @classmethod
-    def _strip_required_text(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("字段不能为空字符串")
-        return value
+    def _check_value(cls, v: object) -> Value:
+        return _validate_value(v)
 
 
-class ResultRow(BaseModel):
-    """旧仪器返回的一条结果。"""
+class DeleteOp(BaseModel):
+    """按 ID 删除；删除不存在的 ID 为幂等空操作。"""
 
-    result_id: str = Field(..., min_length=1, description="结果唯一号")
-    well_position: str = Field(..., min_length=1, description="孔位，如 A01")
-    analyte: str = Field(..., min_length=1, description="检测项目，如 铅Pb")
-    measured_at: StrictInt = Field(..., description="实测时间，整数 UTC 秒")
-    measured_value: Union[StrictInt, float, str, bool] = Field(
-        ..., description="检测值；数字或字符串（如 未检出），响应中原样保留"
-    )
+    model_config = ConfigDict(extra="forbid")
 
-    @field_validator("well_position", "analyte", "result_id")
-    @classmethod
-    def _strip_required_text(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("字段不能为空字符串")
-        return value
+    op: Literal["delete"]
+    id: str = Field(min_length=1, max_length=128, description="要删除的结果 ID")
 
 
-class ReconcileRequest(BaseModel):
-    tolerance_seconds: StrictInt = Field(
-        ..., ge=0, description="允许的最大绝对时间差（含边界），整数 UTC 秒"
-    )
-    plan_rows: List[PlanRow] = Field(..., max_length=MAX_ROWS)
-    result_rows: List[ResultRow] = Field(..., max_length=MAX_ROWS)
+Operation = Annotated[Union[PutOp, DeleteOp], Field(discriminator="op")]
+
+
+class BatchRequest(BaseModel):
+    """一批写入/删除：1～100 条，整体原子生效。"""
+
+    operations: List[Operation] = Field(min_length=1, max_length=100)
 
     @model_validator(mode="after")
-    def _check_unique_ids(self) -> "ReconcileRequest":
-        plan_ids = [row.row_id for row in self.plan_rows]
-        if len(set(plan_ids)) != len(plan_ids):
-            raise ValueError("plan_rows.row_id 必须唯一")
-        result_ids = [row.result_id for row in self.result_rows]
-        if len(set(result_ids)) != len(result_ids):
-            raise ValueError("result_rows.result_id 必须唯一")
+    def _unique_ids(self) -> "BatchRequest":
+        ids = [op.id for op in self.operations]
+        if len(ids) != len(set(ids)):
+            raise ValueError("同一批次内 ID 不能重复")
         return self
 
 
-class ResultVerdictResponse(BaseModel):
-    result_id: str = Field(..., description="结果唯一号，与输入对应")
-    well_position: str
-    analyte: str
-    measured_at: StrictInt
-    measured_value: Union[StrictInt, float, str, bool] = Field(
-        ..., description="检测值原样保留"
-    )
-    possible_plan_row_ids: List[str] = Field(
-        ...,
-        description="在全部最优方案中该结果可能归属的计划行号；无任何可能配对时为空数组",
-    )
-    can_be_unmatched: bool = Field(
-        ..., description="是否存在某个最优方案使该结果未匹配"
-    )
-    always_matched: bool = Field(
-        ..., description="是否在全部最优方案中都处于匹配状态"
-    )
-    sample_no: Optional[str] = Field(
-        ...,
-        description=(
-            "样品号；仅当归属始终唯一且始终匹配时填入，"
-            "歧义或可能未匹配时为 null，避免误导入"
-        ),
-    )
-    assigned_plan_row_id: Optional[str] = Field(
-        ..., description="与 sample_no 同一条件下填入的计划行号，否则为 null"
+class BatchResponse(BaseModel):
+    revision: int = Field(description="本批次产生的递增修订号")
+    applied: int = Field(description="生效的操作条数")
+    puts: int
+    deletes: int
+
+
+class RevisionInfo(BaseModel):
+    revision: int
+    created_at: str
+    puts: int
+    deletes: int
+
+
+class SnapshotRequest(BaseModel):
+    """首次取数：项目 + 日期闭区间 + 页大小。"""
+
+    project: str = Field(min_length=1, max_length=128, description="检测项目")
+    date_from: str = Field(description="起始日期 YYYY-MM-DD（含）")
+    date_to: str = Field(description="截止日期 YYYY-MM-DD（含）")
+    page_size: int = Field(ge=1, le=100, description="页大小 1～100")
+
+    @field_validator("date_from", "date_to")
+    @classmethod
+    def _check_dates(cls, v: str) -> str:
+        return _validate_date(v)
+
+    @model_validator(mode="after")
+    def _range_ok(self) -> "SnapshotRequest":
+        if self.date_from > self.date_to:
+            raise ValueError("date_from 不能晚于 date_to（闭区间）")
+        return self
+
+
+class ResultItem(BaseModel):
+    id: str
+    sample_code: str
+    project: str
+    test_date: str
+    value: Value
+
+
+class Page(BaseModel):
+    number: int = Field(description="页码，从 1 开始")
+    items: List[ResultItem]
+    next_cursor: Optional[str] = Field(
+        description="下一页游标；为 null 表示已是最后一页"
     )
 
 
-class RepresentativePair(BaseModel):
-    result_id: str
-    plan_row_id: str
-    time_diff_seconds: StrictInt
+class SnapshotInfo(BaseModel):
+    snapshot_id: str
+    project: str
+    date_from: str
+    date_to: str
+    page_size: int
+    revision: int = Field(description="快照固定的修订号")
+    created_at: str
 
 
-class ReconcileResponse(BaseModel):
-    tolerance_seconds: StrictInt
-    pair_count: int = Field(..., description="最优方案的配对数（最大配对数）")
-    total_time_diff_seconds: int = Field(
-        ..., description="最优方案的时间差总和（最大配对数下的最小值）"
-    )
-    ambiguous_result_count: int = Field(
-        ...,
-        description=(
-            "歧义结果数：存在多个可能归属，或存在使其未匹配的最优方案；"
-            "确定无候选可配的结果不计入"
-        ),
-    )
-    always_matched_count: int = Field(..., description="在所有最优方案中都匹配的结果数")
-    representative_matching: List[RepresentativePair] = Field(
-        ..., description="一个代表性最优方案，仅供参考，不应直接作为确定归属导入"
-    )
-    results: List[ResultVerdictResponse] = Field(
-        ..., description="逐条结果的核对结论，顺序与输入一致"
-    )
+class SnapshotCreated(SnapshotInfo):
+    page: Page = Field(description="第一页")
+
+
+class PageResponse(BaseModel):
+    snapshot_id: str
+    revision: int
+    page: Page

@@ -1,18 +1,33 @@
+name: lab-snapshot
+
+# 两个服务进程（app1/app2）共享同一个 SQLite 数据库文件（命名卷 labdata），
+# 用于演示并发写入、开启快照与翻页时快照语义依然成立。
 services:
-  web:
+  app1:
     build:
       context: .
       target: runtime
-    image: lab-reconcile-api:latest
+    image: lab-snapshot-api:latest
+    environment:
+      RESULTS_DB: /data/results.db
+    volumes:
+      - labdata:/data
     ports:
-      - "8000:8000"
+      - "8001:8000"
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
+
+  app2:
+    build:
+      context: .
+      target: runtime
+    image: lab-snapshot-api:latest
+    environment:
+      RESULTS_DB: /data/results.db
+    volumes:
+      - labdata:/data
+    ports:
+      - "8002:8000"
+    restart: unless-stopped
 
   # 只在显式启用 test profile 时运行：
   # docker compose --profile test run --rm tests
@@ -21,5 +36,8 @@ services:
     build:
       context: .
       target: test
-    image: lab-reconcile-api-test:latest
+    image: lab-snapshot-api-test:latest
     command: ["pytest", "-q"]
+
+volumes:
+  labdata:

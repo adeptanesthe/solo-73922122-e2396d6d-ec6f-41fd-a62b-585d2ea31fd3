@@ -1,6 +1,11 @@
+.git/
 __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
-.git/
 *.egg-info/
+*.db
+*.db-shm
+*.db-wal
+results.db
+README.md
